@@ -16,7 +16,7 @@ local databases are not part of this repository.
 ```mermaid
 flowchart TD
     Settings["Settings<br/>Strategies, symbols and position limits<br/>Stop loss and take profit"]
-    News["News sources<br/>RSS or a synthetic demo headline"]
+    News["News sources<br/>RSS and exchange announcements"]
     Market["Bybit market data<br/>Prices, volume, order book<br/>Funding, open interest, liquidations"]
     Classifier["News classification<br/>Asset, sentiment and importance<br/>Mock or configured AI classifier"]
 
@@ -32,7 +32,7 @@ flowchart TD
         Funding["3. Open Interest / Funding Squeeze<br/>Price, positions and funding"]
         Liquidation["4. Liquidation Momentum<br/>Liquidations plus price momentum"]
         Meme["5. Meme Trend<br/>Meme-asset momentum and trends"]
-        Range["6. Range Mean Reversion<br/>Price reversal in a range - off by default"]
+        Range["6. Range Mean Reversion<br/>Range-bound reversal - off by default"]
     end
 
     Strategies --> Candidate["Trade candidate<br/>Direction and proposed trade parameters"]
@@ -50,13 +50,80 @@ flowchart TD
     Close --> Database
 ```
 
-The six strategies above belong to V2. Five strategy switches are enabled by
-default; Range Mean Reversion is disabled. The V2 runtime and automatic Demo
-execution are themselves disabled by default and require explicit configuration.
-The [News Momentum portfolio demo](#news-momentum-portfolio-demo) uses the V1
-news pipeline with a synthetic headline and mock classifier. Settings are
-configured through environment variables and runner parameters; there is no
-settings dashboard yet. Live trading is blocked.
+### Step by step
+
+1. **Collect data.** The bot reads news and public market data, including prices,
+   volume, order-book information, funding, open interest and liquidations.
+   Availability depends on the configured providers and the strategy.
+2. **Filter and classify news.** Code normalizes and filters incoming items. A
+   configured classifier identifies the asset, sentiment, confidence, category
+   and urgency. The classifier may use an LLM; the default is a deterministic
+   mock. Invalid, neutral or insufficiently confident classifications do not
+   become eligible news signals.
+3. **Build market features.** Python code calculates rolling indicators, such
+   as price momentum, volume acceleration, order-book imbalance and market
+   regime. It also checks whether the data is available and fresh.
+4. **Evaluate strategies.** Enabled strategies inspect the relevant features
+   and produce trade candidates. News Momentum also requires an eligible news
+   classification; the other strategies use their own market inputs.
+5. **Score and check risk.** Code evaluates setup validity, confidence,
+   estimated costs and edge, data freshness, position limits and portfolio
+   exposure. Candidates can be rejected or deduplicated; eligible candidates
+   are ranked for selection.
+6. **Execute or do nothing.** A candidate that passes the checks may proceed to
+   execution if the configured mode permits it. Otherwise, no order is sent.
+   V1 supports local PAPER execution; exchange execution is restricted to the
+   explicitly configured Bybit Demo environment. Live trading is blocked.
+7. **Manage and record.** The execution layer tracks order and position state,
+   verifies protective orders, and reconciles with the exchange when needed.
+   When persistence is configured, news, candidates, decisions and execution
+   events are stored for inspection and recovery.
+
+### What the LLM does and what the code does
+
+| Component | Responsibility |
+| --- | --- |
+| **Optional LLM classifier** | Classifies filtered news into structured fields such as asset, sentiment, category and confidence. It does not place orders. |
+| **Python pipeline** | Collects and validates data, filters news, calculates market features, evaluates strategies and checks classifier output. |
+| **Scoring and risk code** | Scores candidates, estimates costs, applies limits and decides whether a candidate is eligible. |
+| **Execution and persistence code** | Sizes and submits permitted orders, manages position protection, reconciles state and stores the audit trail. |
+
+An LLM is not required for the pipeline to run: the default classifier is a
+deterministic mock. The LLM does not control position sizing, risk limits or
+order submission.
+
+### Six V2 strategies
+
+| Strategy | What it looks for | Main inputs |
+| --- | --- | --- |
+| **News Momentum** | A significant classified news item followed by a price move in the same direction. | News sentiment and confidence; price momentum. |
+| **Volume Breakout** | A price breakout confirmed across time windows by accelerating volume and trade flow. | Breakout distance, volume acceleration and trade imbalance. |
+| **Open Interest / Funding Squeeze** | A directional price impulse interpreted alongside changing open interest and funding conditions. | Price momentum, open-interest change and funding deviation. |
+| **Liquidation Momentum** | Price continuation supported by recent, sufficiently strong liquidation activity. | Liquidation imbalance and intensity, price momentum and order book. |
+| **Meme Trend** | Momentum in supported meme assets with market activity and external trend context. | Price and volume, relative strength, order book and external trends. |
+| **Range Mean Reversion** | A potential reversal near a range extreme, confirmed by order flow. | Market regime, distance from range extremes and trade/order-book imbalance. |
+
+Five strategy switches are enabled by default; Range Mean Reversion is disabled.
+The V2 runtime and its automatic Demo execution are also disabled by default
+and must be explicitly enabled. A strategy being enabled does not guarantee a
+signal or an order. See [strategy implementation](app/v2/strategies.py) and
+[configuration](app/config.py).
+
+### How the work runs concurrently
+
+In V2, the news pipeline runs as an asynchronous task alongside the market
+strategy cycle. Market strategies can therefore be evaluated without waiting
+for slow news retrieval or classification. Within the market cycle,
+symbols and applicable strategies are evaluated in a loop; the diagram does
+not imply that all six strategy calculations run in separate threads.
+
+Eligible candidates are scored and ranked for selection. Execution can be
+dispatched concurrently across symbols, while each symbol has a single-worker
+execution queue. Portfolio reservations and risk limits coordinate exposure
+and prevent competing candidates from independently bypassing the limits.
+
+Settings are provided through environment variables and runner parameters;
+there is no settings dashboard yet.
 
 ## ByBot V2 (direct Bybit Demo only)
 
@@ -91,24 +158,6 @@ initializes exchange mutation code.
 
 Operator-authorized commands are documented in `docs/RUNBOOK.md`; automated
 development never starts the burn-in or soak.
-
-## News Momentum portfolio demo
-
-`scripts/news_momentum_demo.ps1` runs the V1 news pipeline against Bybit Demo:
-it accepts a synthetic headline, classifies it with a deterministic mock, and
-uses live public market data and risk checks before submitting a Demo order.
-Set Demo API credentials in the launching PowerShell process and ensure local
-PostgreSQL and the selected demo database already exist. For example:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\news_momentum_demo.ps1 `
-  -AllowDemoOrders -Symbol ETHUSDT -MaxNotionalUSDT 100 `
-  -MinTrendChangePct 0.01 -MinExpectedEdgeBps 3
-```
-
-The runner can submit orders on the Demo account. Entry and exit timing depend
-on market movement; a synthetic headline is not a prediction. For an offline
-PAPER walkthrough use `scripts/portfolio_demo.ps1` and `compose.portfolio.yml`.
 
 ## Scope
 
@@ -678,54 +727,6 @@ prevents application startup. `PaperExecutionEngine` only accepts PAPER mode.
 configuration validation. Live/mainnet/testnet execution remains impossible.
 The only exchange adapter is Bybit Demo and it requires the complete explicit
 Demo gate plus exact Demo domains.
-
-## Bybit Demo soak (explicit opt-in)
-
-Configure Demo-only API credentials in the untracked `.env`. The runner uses
-real RSS, real public market data, the configured classifier, actual Demo fills,
-and exchange-side TP/SL. It performs a controlled restart and cleans up only
-bot-owned Demo orders and positions. It has no synthetic trade; zero trades is
-a valid result.
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\bybit_demo_soak.ps1 -Hours 12 -SampleSeconds 30 -AllowDemoOrders
-```
-
-The explicit `-AllowDemoOrders` switch is mandatory. Never point this command
-at mainnet or testnet credentials/domains.
-
-For a single controlled BTCUSDT Demo canary with an explicit maximum budget,
-use:
-
-```powershell
-powershell -ExecutionPolicy Bypass `
-  -File .\scripts\bybit_demo_canary.ps1 `
-  -Symbol BTCUSDT `
-  -MaxNotionalUSDT 75 `
-  -AllowDemoOrders
-```
-
-The canary uses the normal durable Demo execution service, verifies exchange
-fill and TP/SL, restarts and reconciles FastAPI, then closes via a reduce-only
-Demo order. Omitting `-AllowDemoOrders` performs no setup or exchange action.
-Immediately before persistence or order submission, the canary reads the
-current instrument rules and price, rounds the minimum valid quantity upward,
-and requires that quantity plus the configured 5% price buffer to fit inside
-`MaxNotionalUSDT`. The maximum is never increased and the script submits the
-calculated minimum quantity, not the full budget.
-After printing that plan, it requires a second typed confirmation for the
-exact calculated Demo quantity before calling the execution endpoint.
-Its JSON report separates normal canary functionality from safety cleanup, so
-a recovered flat account cannot hide a failed fill/open/restart workflow.
-
-Inspect a Demo kill-switch without enabling Demo trading or starting FastAPI:
-
-```powershell
-.\.venv\Scripts\python.exe .\scripts\demo_kill_switch_diagnostics.py
-```
-
-See [docs/RUNBOOK.md](docs/RUNBOOK.md) for the guarded dry-run and explicit
-reset commands.
 
 ## Repair historical NewsItem payloads
 
