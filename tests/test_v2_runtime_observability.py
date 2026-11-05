@@ -1,0 +1,718 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from urllib.error import URLError
+import socket
+
+from app.config import Settings
+from app.models import NewsItem, Symbol
+from app.news import MockNewsClassifier, NewsService
+from app.v2.analytics import V2ReportGenerator
+from app.v2.market import RollingFeatureEngine
+from app.v2.models import SourceState, StrategyName
+from app.v2.news import EntityMapper
+from app.v2.runtime import V2Runtime
+from app.v2.strategies import build_v2_strategies
+from tests.test_v2_system import feature
+
+
+class MemoryRepository:
+    available = True
+
+    def __init__(self) -> None:
+        self.signals = []
+        self.incidents = {}
+        self.runtime = {}
+
+    def load_v2_signal_candidates(self, run_id):
+        return []
+
+    def load_v2_run_runtime(self, run_id):
+        return self.runtime
+
+    def update_v2_run_runtime(self, run_id, payload):
+        self.runtime = payload
+        return True
+
+    def begin_v2_run(self, run_id, started_at):
+        return True
+
+    def save_v2_market_feature(self, snapshot):
+        return True
+
+    def save_v2_signal_candidate(self, candidate):
+        self.signals.append(candidate)
+        return True
+
+    def save_v2_incident(self, incident):
+        self.incidents[str(incident.id)] = incident
+        return True
+
+    def load_demo_executions(self):
+        return []
+
+    def finish_v2_run(self, run_id, report):
+        return True
+
+    def v2_report_rows(self, run_id):
+        return {
+            "signals": [item.model_dump(mode="json") for item in self.signals],
+            "rejections": [
+                item.model_dump(mode="json") for item in self.signals
+                if item.rejection_reason
+            ],
+            "incidents": [
+                item.model_dump(mode="json") for item in self.incidents.values()
+            ],
+            "executions": [], "runtime": self.runtime,
+        }
+
+
+class Universe:
+    def __init__(self, symbols: tuple[Symbol, ...]) -> None:
+        self.accepted_symbols = symbols
+        self.statuses = {
+            symbol: SimpleNamespace(accepted=True, reasons=[]) for symbol in symbols
+        }
+        self.last_refresh_at = datetime.now(timezone.utc)
+
+    def get(self, symbol):
+        return self.statuses.get(symbol)
+
+    def refresh(self, now=None):
+        return self.statuses
+
+
+class Features:
+    stale_incidents = 0
+    source_states = {}
+
+    def __init__(self, failures: set[Symbol] | None = None) -> None:
+        self.failures = failures or set()
+        self.calls = []
+
+    def snapshot(self, symbol, btc_snapshot=None):
+        self.calls.append(symbol)
+        if symbol in self.failures:
+            raise ValueError("required market decimal missing")
+        return feature(symbol)
+
+
+class Aggregator:
+    def __init__(self, rows=None) -> None:
+        self.rows = rows or []
+        self.sources = [SimpleNamespace(name="mock-rss", reliability=1.0)]
+        self.health = {"mock-rss": SourceState(source="mock-rss")}
+        self.source_metrics = {
+            "mock-rss": {
+                "fetch_attempts": 0, "fetch_successes": 0,
+                "fetch_failures": 0, "items_received": 0,
+            }
+        }
+        self.items_received = 0
+        self.items_rejected = 0
+        self.duplicate_count = 0
+        self.last_poll_audit = []
+
+    async def poll(self):
+        self.source_metrics["mock-rss"]["fetch_attempts"] += 1
+        self.source_metrics["mock-rss"]["fetch_successes"] += 1
+        self.items_received += len(self.rows)
+        self.source_metrics["mock-rss"]["items_received"] += len(self.rows)
+        self.last_poll_audit = [{
+            "news_id": str(item.id), "source": item.source, "title": item.title,
+            "url": item.url, "published_at": item.published_at.isoformat(),
+            "received_at": item.received_at.isoformat(),
+            "deduplication_status": "unique",
+            "detected_entities": [symbol.value.removesuffix("USDT") for symbol in symbols],
+            "mapped_symbols": [symbol.value for symbol in symbols],
+            "market_wide": len(symbols) > 1,
+            "deterministic_filter_decision": "accepted",
+        } for item, symbols, _ in self.rows]
+        return self.rows
+
+
+class Portfolio:
+    reservations = []
+    ACTIVE = set()
+    kill_switch_active = False
+    kill_switch_reasons = []
+
+    def block_reasons(self, symbol, notional):
+        return []
+
+
+class Execution:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.demo_execution = SimpleNamespace(
+            kill_switch_active=False, kill_switch_reasons=[],
+            monitor_strategy_position=lambda *args, **kwargs: None,
+        )
+
+    def safety_preflight(self, require_auto_execution=False):
+        return []
+
+    def execute(self, candidate):
+        self.calls += 1
+        raise AssertionError("exchange mutation must not run in tests")
+
+
+def settings(tmp_path: Path, **updates: object) -> Settings:
+    values: dict[str, object] = {
+        "_env_file": None, "v2_enabled": True,
+        "v2_auto_demo_execution": False,
+        "v2_report_directory": str(tmp_path),
+        "v2_min_turnover_24h_usdt": 0,
+        "v2_min_orderbook_depth_usdt": 0,
+    }
+    values.update(updates)
+    return Settings(**values)
+
+
+def runtime(
+    tmp_path: Path, symbols: tuple[Symbol, ...], *, failures=None,
+    aggregator=None, news_service=None,
+):
+    repo = MemoryRepository(); execution = Execution()
+    app = V2Runtime(
+        settings(tmp_path), repo, Universe(symbols), Features(failures),
+        aggregator or Aggregator(),
+            news_service or NewsService(
+                [], MockNewsClassifier(), max_item_age=timedelta(hours=1)
+            ),
+        Portfolio(), execution, None, run_id="runtime-test",
+    )
+    app._last_rest_poll_at = datetime.now(timezone.utc)
+    return app, repo, execution
+
+
+def test_sparse_ticker_delta_preserves_last_price(tmp_path) -> None:
+    engine = RollingFeatureEngine(settings(tmp_path))
+    now = datetime.now(timezone.utc)
+    engine.ingest_ticker(Symbol.ETHUSDT, {"lastPrice": "3500"}, now)
+    engine.ingest_trade(Symbol.ETHUSDT, feature().last_price, feature().last_price / 100, "BUY", now)
+    engine.ingest_orderbook(Symbol.ETHUSDT, [["3499", "10"]], [["3501", "10"]], now)
+
+    engine.ingest_ticker(Symbol.ETHUSDT, {"fundingRate": "0.0001"}, now)
+
+    assert engine.snapshot(Symbol.ETHUSDT, now=now).last_price == 3500
+
+
+def test_orderbook_delta_updates_levels_without_crossed_negative_spread(tmp_path) -> None:
+    engine = RollingFeatureEngine(settings(tmp_path))
+    now = datetime.now(timezone.utc)
+    engine.ingest_ticker(Symbol.ETHUSDT, {"lastPrice": "3500"}, now)
+    engine.ingest_trade(Symbol.ETHUSDT, feature().last_price, feature().last_price / 100, "BUY", now)
+    engine.ingest_orderbook(Symbol.ETHUSDT, [["3499", "10"]], [["3501", "10"]], now)
+
+    engine.ingest_orderbook(
+        Symbol.ETHUSDT, [["3498", "1"]], [["3502", "1"]], now,
+        snapshot=False,
+    )
+
+    snapshot = engine.snapshot(Symbol.ETHUSDT, now=now)
+    assert snapshot.bid_price == 3499
+    assert snapshot.ask_price == 3501
+    assert snapshot.spread_bps >= 0
+
+
+def test_all_accepted_symbols_are_processed_and_no_exchange_mutation(tmp_path) -> None:
+    symbols = (Symbol.BTCUSDT, Symbol.ETHUSDT, Symbol.DOGEUSDT, Symbol.WIFUSDT)
+    app, _, execution = runtime(tmp_path, symbols)
+
+    asyncio.run(app.cycle())
+
+    assert set(app.status()["symbols_successful"]) == {item.value for item in symbols}
+    assert app.symbol_cycle_metrics["BTCUSDT"]["strategies_evaluated"] == 2
+    assert app.symbol_cycle_metrics["ETHUSDT"]["strategies_evaluated"] == 2
+    assert app.symbol_cycle_metrics["DOGEUSDT"]["strategies_evaluated"] == 3
+    assert app.symbol_cycle_metrics["WIFUSDT"]["strategies_evaluated"] == 3
+    assert app.strategy_not_applicable_counts["LiquidationMomentumStrategy"] == 4
+    assert execution.calls == 0
+
+
+def test_one_symbol_failure_does_not_block_later_symbols(tmp_path) -> None:
+    symbols = (Symbol.BTCUSDT, Symbol.ETHUSDT, Symbol.SOLUSDT)
+    app, repo, _ = runtime(tmp_path, symbols, failures={Symbol.ETHUSDT})
+
+    asyncio.run(app.cycle())
+
+    assert app.symbol_cycle_metrics["BTCUSDT"]["cycles_succeeded"] == 1
+    assert app.symbol_cycle_metrics["ETHUSDT"]["cycles_failed"] == 1
+    assert app.symbol_cycle_metrics["SOLUSDT"]["cycles_succeeded"] == 1
+    incident = next(iter(repo.incidents.values()))
+    assert incident.payload["message"] == "required market decimal missing"
+    assert incident.payload["processing_stage"] == "feature_generation"
+    assert incident.payload["symbol"] == "ETHUSDT"
+
+
+def test_strategy_failure_does_not_block_other_strategy(tmp_path) -> None:
+    app, repo, _ = runtime(tmp_path, (Symbol.BTCUSDT,))
+    strategies = list(build_v2_strategies(app.settings))
+    failing = next(row for row in strategies if row.name == StrategyName.OI_FUNDING_SQUEEZE)
+    succeeding = next(row for row in strategies if row.name == StrategyName.VOLUME_BREAKOUT)
+    failing.evaluate = lambda features, **context: (_ for _ in ()).throw(ValueError("bad OI"))  # type: ignore[method-assign]
+    app.strategies = (failing, succeeding)
+
+    asyncio.run(app.cycle())
+
+    assert any(item.strategy_name == StrategyName.VOLUME_BREAKOUT for item in repo.signals)
+    assert any(
+        item.payload["strategy"] == StrategyName.OI_FUNDING_SQUEEZE.value
+        for item in repo.incidents.values()
+    )
+
+
+def test_repeated_failures_are_fingerprinted_and_counted(tmp_path) -> None:
+    app, repo, _ = runtime(tmp_path, (Symbol.BTCUSDT,))
+
+    def record() -> None:
+        try:
+            raise ValueError("same deterministic failure")
+        except ValueError as exc:
+            app._record_failure(
+                exc, stage="feature_generation", cycle_id="c",
+                symbol=Symbol.BTCUSDT,
+            )
+
+    record(); record()
+
+    assert len(repo.incidents) == 1
+    assert next(iter(repo.incidents.values())).payload["occurrence_count"] == 2
+
+
+def test_dns_outage_pauses_entries_without_cycle_failure_and_recovers(
+    tmp_path,
+) -> None:
+    app, repo, execution = runtime(tmp_path, (Symbol.BTCUSDT,))
+    app._last_rest_poll_at = None
+    app.rest_metrics.poll = lambda symbols: (_ for _ in ()).throw(
+        URLError(socket.gaierror(11001, "getaddrinfo failed"))
+    )
+
+    asyncio.run(app.cycle())
+
+    assert app.failure_occurrences == {}
+    assert app.dependency_health.entries_paused
+    assert app.features.calls == []
+    incidents = list(repo.incidents.values())
+    assert len(incidents) == 1
+    assert incidents[0].event_type == "EXTERNAL_DEPENDENCY_OUTAGE"
+
+    app.dependency_health.next_retry_at = datetime.now(timezone.utc)
+    app.rest_metrics.poll = lambda symbols: None
+    execution.demo_execution.reconcile = lambda: {"status": "OK"}
+    asyncio.run(app.cycle())
+
+    assert not app.dependency_health.entries_paused
+    assert app.failure_occurrences == {}
+    assert app.features.calls == [Symbol.BTCUSDT]
+    assert len(repo.incidents) == 1
+
+
+def test_dns_outage_during_draining_never_regresses_phase(tmp_path) -> None:
+    app, _, _ = runtime(tmp_path, (Symbol.BTCUSDT,))
+    app.begin_draining()
+    app._last_rest_poll_at = None
+    app.rest_metrics.poll = lambda symbols: (_ for _ in ()).throw(
+        URLError(socket.gaierror(11001, "getaddrinfo failed"))
+    )
+
+    asyncio.run(app.cycle())
+
+    assert app.status()["run_phase"] in {"DRAINING", "RECONCILING", "FINISHED"}
+    assert app.status()["run_phase"] != "RUNNING"
+    assert app.failure_occurrences == {}
+
+
+def test_handled_cooldown_rejection_is_not_cycle_failure_and_preserves_context(
+    tmp_path,
+) -> None:
+    app, repo, _ = runtime(tmp_path, (Symbol.LTCUSDT, Symbol.ETHUSDT))
+    strategy = next(
+        item for item in app.strategies
+        if item.name == StrategyName.VOLUME_BREAKOUT
+    )
+    ltc = strategy.evaluate(feature(Symbol.LTCUSDT))
+    eth = strategy.evaluate(feature(Symbol.ETHUSDT))
+    reservation_id = "5de14993-9ad8-4458-9bff-d9a23f9b2f6f"
+
+    async def collect() -> None:
+        loop = asyncio.get_running_loop()
+        rejected = loop.create_future()
+        rejected.set_result({
+            "handled_policy_rejection": True,
+            "candidate_id": str(ltc.id),
+            "reservation_id": reservation_id,
+            "execution_id": None,
+            "rejection_code": "SYMBOL_COOLDOWN_ACTIVE",
+            "rejection_message": "symbol cooldown is active",
+            "risk_control": "symbol_cooldown",
+            "rejected_at": "2026-07-20T09:15:25.383788+00:00",
+            "exchange_mutation_performed": False,
+        })
+        succeeded = loop.create_future()
+        succeeded.set_result({"execution_id": "execution-for-other-symbol"})
+        await app._collect_dispatches(
+            [(ltc, rejected), (eth, succeeded)], "runtime-test:1"
+        )
+
+    asyncio.run(collect())
+
+    incidents = list(repo.incidents.values())
+    assert len(incidents) == 1
+    incident = incidents[0]
+    assert incident.event_type == "EXECUTION_REJECTED"
+    assert str(incident.candidate_id) == str(ltc.id)
+    assert incident.payload["reservation_id"] == reservation_id
+    assert incident.payload["execution_id"] is None
+    assert incident.payload["exchange_mutation_performed"] is False
+    assert app.failure_occurrences == {}
+    assert app.signal_metrics["execution_policy_rejections"] == 1
+    assert app.signal_metrics["cooldown_rejections"] == 1
+    assert app.signal_metrics["admitted_signals"] == 1
+    for handler in app.logger.handlers:
+        handler.flush()
+    event = next(
+        json.loads(line)
+        for line in Path(
+            app.settings.v2_report_directory,
+            app.run_id,
+            "events.jsonl",
+        ).read_text(encoding="utf-8").splitlines()
+        if '"event_type": "EXECUTION_REJECTED"' in line
+    )
+    report = app.reporter.generate(app.run_id)
+    reported_incident = json.loads(
+        Path(report["artifact_directory"], "incidents.json").read_text(
+            encoding="utf-8"
+        )
+    )[0]
+    assert event["timestamp"] == reported_incident["occurred_at"]
+
+
+def test_signal_metrics_distinguish_pre_execution_and_policy_rejection(tmp_path) -> None:
+    runtime_payload = {
+        "accepted_symbols": ["LTCUSDT"],
+        "symbol_cycle_metrics": {
+            "LTCUSDT": {
+                "cycles_attempted": 1, "cycles_succeeded": 1,
+                "cycles_failed": 0,
+            }
+        },
+        "enabled_strategies": ["VolumeBreakoutStrategy"],
+        "strategy_evaluation_counts": {"VolumeBreakoutStrategy": 1},
+        "signal_metrics": {
+            "raw_candidates": 1, "threshold_passes": 1,
+            "pre_execution_admissions": 1,
+            "execution_policy_rejections": 1,
+            "cooldown_rejections": 1,
+            "admitted_signals": 0,
+        },
+    }
+    incident = {
+        "id": "handled", "run_id": "r", "event_type": "EXECUTION_REJECTED",
+        "payload": {
+            "candidate_id": "candidate", "reservation_id": "reservation",
+            "processing_stage": "demo_execution",
+            "rejection_code": "SYMBOL_COOLDOWN_ACTIVE",
+        },
+    }
+    report = V2ReportGenerator(
+        _report_repo(runtime_payload, [incident]), str(tmp_path)
+    ).generate("r")
+    assert report["functional_result"] == "PASS"
+    assert report["total_cycle_failures"] == 0
+    assert report["pre_execution_admissions"] == 1
+    assert report["execution_policy_rejections"] == 1
+    assert report["cooldown_rejections"] == 1
+    assert report["admitted_signals"] == 0
+
+
+def test_persistence_rejection_is_not_reported_as_risk_rejection(tmp_path) -> None:
+    runtime_payload = {
+        "accepted_symbols": ["LTCUSDT"],
+        "symbol_cycle_metrics": {
+            "LTCUSDT": {
+                "cycles_attempted": 1, "cycles_succeeded": 1,
+                "cycles_failed": 0,
+            }
+        },
+        "enabled_strategies": ["VolumeBreakoutStrategy"],
+        "strategy_evaluation_counts": {"VolumeBreakoutStrategy": 1},
+        "signal_metrics": {
+            "raw_candidates": 1,
+            "threshold_passes": 1,
+            "pre_execution_admissions": 1,
+            "persistence_rejections": 1,
+            "risk_rejections": 0,
+            "admitted_signals": 0,
+        },
+    }
+    report = V2ReportGenerator(
+        _report_repo(runtime_payload, []), str(tmp_path)
+    ).generate("r")
+
+    assert report["functional_result"] == "FAIL"
+    assert report["persistence_rejections"] == 1
+    assert report["risk_rejections"] == 0
+    assert "execution compatibility persistence failed" in report["functional_blockers"]
+
+
+def test_runtime_marks_persistence_rejection_as_run_invalid(tmp_path) -> None:
+    app, repository, _ = runtime(tmp_path, (Symbol.LTCUSDT,))
+    strategy = next(
+        item for item in app.strategies
+        if item.name == StrategyName.VOLUME_BREAKOUT
+    )
+    candidate = strategy.evaluate(feature(Symbol.LTCUSDT))
+
+    async def collect() -> None:
+        future = asyncio.get_running_loop().create_future()
+        future.set_result({
+            "handled_persistence_rejection": True,
+            "rejection_code": "DB_NEWS_CONTENT_COLLISION",
+        })
+        await app._collect_dispatches([(candidate, future)], "runtime-test:db")
+
+    asyncio.run(collect())
+
+    assert app.run_valid is False
+    assert app.signal_metrics["persistence_rejections"] == 1
+    assert app.signal_metrics["risk_rejections"] == 0
+    incident = next(iter(repository.incidents.values()))
+    assert incident.event_type == "EXECUTION_PERSISTENCE_REJECTED"
+    assert incident.error_category == "DB_NEWS_CONTENT_COLLISION"
+    assert incident.payload["exchange_mutation_performed"] is False
+
+
+def test_unexpected_execution_exception_remains_cycle_failure(tmp_path) -> None:
+    app, repo, _ = runtime(tmp_path, (Symbol.LTCUSDT,))
+    strategy = next(
+        item for item in app.strategies
+        if item.name == StrategyName.VOLUME_BREAKOUT
+    )
+    candidate = strategy.evaluate(feature(Symbol.LTCUSDT))
+
+    async def collect() -> None:
+        future = asyncio.get_running_loop().create_future()
+        future.set_exception(RuntimeError("unexpected execution defect"))
+        await app._collect_dispatches([(candidate, future)], "runtime-test:1")
+
+    asyncio.run(collect())
+
+    incident = next(iter(repo.incidents.values()))
+    assert incident.event_type == "V2_CYCLE_FAILURE"
+    assert incident.payload["message"] == "unexpected execution defect"
+
+
+def test_market_strategy_batch_yields_to_status_and_shutdown_tasks(tmp_path) -> None:
+    app, _, _ = runtime(tmp_path, (Symbol.BTCUSDT, Symbol.ETHUSDT))
+
+    async def scenario() -> None:
+        scheduled = asyncio.Event()
+
+        async def status_task() -> None:
+            await asyncio.sleep(0)
+            scheduled.set()
+
+        observer = asyncio.create_task(status_task())
+        await app._process_market_strategies("runtime-test:yield")
+        assert scheduled.is_set()
+        await observer
+
+    asyncio.run(scenario())
+
+
+def test_meme_strategy_scope_is_configuration_driven(tmp_path) -> None:
+    configured = settings(tmp_path, v2_meme_trend_symbols=("DOGEUSDT", "WIFUSDT"))
+    meme = next(
+        row for row in build_v2_strategies(configured)
+        if row.name == StrategyName.MEME_TREND
+    )
+
+    assert meme.applies_to(Symbol.BTCUSDT) is False
+    assert meme.applies_to(Symbol.DOGEUSDT) is True
+    assert meme.applies_to(Symbol.WIFUSDT) is True
+    assert next(
+        row for row in build_v2_strategies(configured)
+        if row.name == StrategyName.VOLUME_BREAKOUT
+    ).applies_to(Symbol.BTCUSDT) is True
+    market_scoped = settings(
+        tmp_path, v2_market_strategy_symbols=("ETHUSDT",)
+    )
+    volume = next(
+        row for row in build_v2_strategies(market_scoped)
+        if row.name == StrategyName.VOLUME_BREAKOUT
+    )
+    assert volume.applies_to(Symbol.BTCUSDT) is False
+    assert volume.applies_to(Symbol.ETHUSDT) is True
+
+
+def test_news_momentum_connected_and_news_audit_files_generated(tmp_path) -> None:
+    item = NewsItem(
+        title="SEC approves Bitcoin ETF", summary="BlackRock BTC ETF approval",
+        source="mock-rss", url="https://example.invalid/news",
+        published_at=datetime.now(timezone.utc),
+    )
+    symbols = EntityMapper().symbols_for_text(f"{item.title} {item.summary}")
+    aggregator = Aggregator([(item, symbols, "fingerprint")])
+    app, repo, _ = runtime(tmp_path, (Symbol.BTCUSDT,), aggregator=aggregator)
+
+    asyncio.run(app.cycle())
+    report = V2ReportGenerator(repo, str(tmp_path)).generate("runtime-test")
+
+    assert app.strategy_evaluation_counts[StrategyName.NEWS_MOMENTUM_V2.value] >= 1
+    assert app.news_metrics["news_momentum_candidates_generated"] == 1
+    assert Path(report["artifact_directory"], "news_items.csv").exists()
+    assert Path(report["artifact_directory"], "news_decisions.csv").exists()
+    assert Path(report["artifact_directory"], "news_sources.json").exists()
+
+
+def _report_repo(runtime_payload, incidents=None, signals=None):
+    return SimpleNamespace(v2_report_rows=lambda run_id: {
+        "signals": signals or [], "rejections": signals or [],
+        "incidents": incidents or [], "executions": [], "runtime": runtime_payload,
+    })
+
+
+def test_functional_result_fails_for_cycle_failure_or_skipped_symbols(tmp_path) -> None:
+    incident = {
+        "id": "failure", "run_id": "r", "event_type": "V2_CYCLE_FAILURE",
+        "payload": {
+            "occurrence_count": 4, "traceback_fingerprint": "fp",
+            "message": "failure", "processing_stage": "feature_generation",
+            "transient": False,
+        },
+    }
+    runtime_payload = {
+        "accepted_symbols": ["BTCUSDT", "ETHUSDT"],
+        "symbol_cycle_metrics": {
+            "BTCUSDT": {"cycles_attempted": 1, "cycles_succeeded": 1, "cycles_failed": 0}
+        },
+        "enabled_strategies": ["VolumeBreakoutStrategy"],
+        "strategy_evaluation_counts": {"VolumeBreakoutStrategy": 1},
+        "cycle_failure_repeat_limit": 3,
+    }
+
+    report = V2ReportGenerator(
+        _report_repo(runtime_payload, [incident]), str(tmp_path)
+    ).generate("r")
+
+    assert report["functional_result"] == "FAIL"
+    assert "accepted symbols were never successfully processed" in report["functional_blockers"]
+
+
+def test_zero_trades_with_healthy_cycles_is_functional_pass(tmp_path) -> None:
+    runtime_payload = {
+        "accepted_symbols": ["BTCUSDT"],
+        "symbol_cycle_metrics": {
+            "BTCUSDT": {"cycles_attempted": 2, "cycles_succeeded": 2, "cycles_failed": 0}
+        },
+        "enabled_strategies": ["VolumeBreakoutStrategy"],
+        "strategy_evaluation_counts": {"VolumeBreakoutStrategy": 2},
+    }
+
+    report = V2ReportGenerator(
+        _report_repo(runtime_payload), str(tmp_path)
+    ).generate("r")
+
+    assert report["functional_result"] == "PASS"
+
+
+def test_safe_degradation_produces_pass_with_warnings(tmp_path) -> None:
+    runtime_payload = {
+        "accepted_symbols": ["BTCUSDT"],
+        "symbol_cycle_metrics": {
+            "BTCUSDT": {
+                "cycles_attempted": 2,
+                "cycles_succeeded": 2,
+                "cycles_failed": 0,
+            }
+        },
+        "enabled_strategies": ["VolumeBreakoutStrategy"],
+        "strategy_evaluation_counts": {"VolumeBreakoutStrategy": 2},
+        "safety_critical_failures": 0,
+        "data_integrity_failures": 0,
+        "unexpected_cycle_failures": 0,
+        "safe_degraded_events": 1,
+        "observability_warnings": 0,
+        "certification_mode": "DISCOVERY",
+    }
+    incident = {
+        "id": "safe",
+        "run_id": "r",
+        "event_type": "V2_SAFE_DEGRADED",
+        "payload": {
+            "classification": "SAFE_DEGRADED",
+            "code": "MANAGEMENT_UPDATE_SKIPPED_OWNERSHIP_UNCONFIRMED",
+            "message": "optional update skipped",
+            "processing_stage": "position_monitoring",
+            "symbol": "BTCUSDT",
+            "strategy": "VolumeBreakoutStrategy",
+            "first_seen_at": "2026-07-31T00:00:00+00:00",
+            "last_seen_at": "2026-07-31T00:00:01+00:00",
+            "occurrence_count": 1,
+            "exchange_mutation_attempted": False,
+            "evidence": {
+                "existing_exchange_protection_remained_valid": True,
+            },
+        },
+    }
+    report = V2ReportGenerator(
+        _report_repo(runtime_payload, [incident]), str(tmp_path)
+    ).generate("r")
+
+    assert report["functional_result"] == "PASS_WITH_WARNINGS"
+    assert report["analytics_result"] == "PASS_WITH_WARNINGS"
+    assert report["total_cycle_failures"] == 0
+    assert report["safe_degraded_events"] == 1
+    assert report["safe_degradation_classes"][0]["count"] == 1
+    assert report["completed_trades"] == 0
+
+
+def test_rejections_include_diagnostic_score_fields(tmp_path) -> None:
+    signal = {
+        "run_id": "r", "id": "candidate", "created_at": datetime.now(timezone.utc).isoformat(),
+        "strategy_name": "VolumeBreakoutStrategy", "symbol": "BTCUSDT", "side": "LONG",
+        "raw_strategy_score": "0.4", "score_components": {"final_score": "0.3"},
+        "threshold": "0.62", "distance_to_threshold": "-0.32",
+        "estimated_edge_bps": "4", "state": "REJECTED",
+        "rejection_reason": "below threshold",
+    }
+    runtime_payload = {
+        "accepted_symbols": [], "symbol_cycle_metrics": {},
+        "enabled_strategies": [], "strategy_evaluation_counts": {},
+    }
+
+    report = V2ReportGenerator(
+        _report_repo(runtime_payload, signals=[signal]), str(tmp_path)
+    ).generate("r")
+    text = Path(report["artifact_directory"], "rejections.csv").read_text(
+        encoding="utf-8-sig"
+    )
+
+    for field in (
+        "side", "raw_score", "final_score", "threshold",
+        "distance_to_threshold", "estimated_edge_bps", "state", "rejection_reason",
+    ):
+        assert field in text.splitlines()[0]
+
+
+def test_runner_resolves_host_database_and_reports_functional_result() -> None:
+    text = Path("scripts/demo_v2_soak.ps1").read_text(encoding="utf-8")
+    assert "Get-HostPostgresPort" in text
+    assert "Set-HostDatabaseEnvironment" in text
+    assert "@127.0.0.1:$Port/" in text
+    assert "ALEMBIC: START" in text
+    assert "READ-ONLY PREFLIGHT: START" in text
+    assert "UVICORN: START" in text
+    assert "$report.functional_result" in text
