@@ -11,6 +11,53 @@ exchange replay fixtures, and tests that depend on those private fixtures.
 Other automated tests remain available. The private development history and
 local databases are not part of this repository.
 
+## How ByBot works
+
+```mermaid
+flowchart TD
+    Settings["Settings<br/>Strategies, symbols and position limits<br/>Stop loss and take profit"]
+    News["News sources<br/>RSS or a synthetic demo headline"]
+    Market["Bybit market data<br/>Prices, volume, order book<br/>Funding, open interest, liquidations"]
+    Classifier["News classification<br/>Asset, sentiment and importance<br/>Mock or configured AI classifier"]
+
+    News --> Classifier
+    Classifier --> NewsMomentum
+    Market --> Strategies
+    Settings -.-> Strategies
+
+    subgraph Strategies["V2 strategy layer"]
+        direction TB
+        NewsMomentum["1. News Momentum<br/>News plus price confirmation"]
+        Volume["2. Volume Breakout<br/>Price breakout plus volume"]
+        Funding["3. Open Interest / Funding Squeeze<br/>Price, positions and funding"]
+        Liquidation["4. Liquidation Momentum<br/>Liquidations plus price momentum"]
+        Meme["5. Meme Trend<br/>Meme-asset momentum and trends"]
+        Range["6. Range Mean Reversion<br/>Price reversal in a range - off by default"]
+    end
+
+    Strategies --> Candidate["Trade candidate<br/>Direction and proposed trade parameters"]
+    Candidate --> Risk["Risk checks<br/>Data freshness, limits, estimated costs<br/>Position size and protective stops"]
+    Settings -.-> Risk
+    Risk --> Decision{"Checks passed?"}
+    Decision -->|"No"| NoTrade["NO TRADE<br/>Record the reason"]
+    Decision -->|"Yes"| Execute["Execution<br/>V1 PAPER or V1/V2 Bybit Demo"]
+    Execute --> Position["Position management<br/>Entry, stop loss and take profit"]
+    Position --> Close["Position closed<br/>Record outcome and trade history"]
+
+    Candidate --> Database[("PostgreSQL<br/>News, signals, decisions and trades")]
+    NoTrade --> Database
+    Position --> Database
+    Close --> Database
+```
+
+The six strategies above belong to V2. Five strategy switches are enabled by
+default; Range Mean Reversion is disabled. The V2 runtime and automatic Demo
+execution are themselves disabled by default and require explicit configuration.
+The [News Momentum portfolio demo](#news-momentum-portfolio-demo) uses the V1
+news pipeline with a synthetic headline and mock classifier. Settings are
+configured through environment variables and runner parameters; there is no
+settings dashboard yet. Live trading is blocked.
+
 ## ByBot V2 (direct Bybit Demo only)
 
 V2 adds a dynamically validated 17-symbol universe, five deterministic
