@@ -25,7 +25,7 @@ flowchart TD
     Market --> Strategies
     Settings -.-> Strategies
 
-    subgraph Strategies["V2 strategy layer"]
+    subgraph Strategies["Strategy engine"]
         direction TB
         NewsMomentum["1. News Momentum<br/>News plus price confirmation"]
         Volume["2. Volume Breakout<br/>Price breakout plus volume"]
@@ -40,7 +40,7 @@ flowchart TD
     Settings -.-> Risk
     Risk --> Decision{"Checks passed?"}
     Decision -->|"No"| NoTrade["NO TRADE<br/>Record the reason"]
-    Decision -->|"Yes"| Execute["Execution<br/>V1 PAPER or V1/V2 Bybit Demo"]
+    Decision -->|"Yes"| Execute["Execution<br/>Bybit Demo, when enabled"]
     Execute --> Position["Position management<br/>Entry, stop loss and take profit"]
     Position --> Close["Position closed<br/>Record outcome and trade history"]
 
@@ -72,8 +72,8 @@ flowchart TD
    are ranked for selection.
 6. **Execute or do nothing.** A candidate that passes the checks may proceed to
    execution if the configured mode permits it. Otherwise, no order is sent.
-   V1 supports local PAPER execution; exchange execution is restricted to the
-   explicitly configured Bybit Demo environment. Live trading is blocked.
+   The six-strategy engine can execute in the explicitly configured Bybit Demo
+   environment. Live trading is blocked.
 7. **Manage and record.** The execution layer tracks order and position state,
    verifies protective orders, and reconciles with the exchange when needed.
    When persistence is configured, news, candidates, decisions and execution
@@ -92,7 +92,7 @@ An LLM is not required for the pipeline to run: the default classifier is a
 deterministic mock. The LLM does not control position sizing, risk limits or
 order submission.
 
-### Six V2 strategies
+### Six strategies
 
 | Strategy | What it looks for | Main inputs |
 | --- | --- | --- |
@@ -103,15 +103,15 @@ order submission.
 | **Meme Trend** | Momentum in supported meme assets with market activity and external trend context. | Price and volume, relative strength, order book and external trends. |
 | **Range Mean Reversion** | A potential reversal near a range extreme, confirmed by order flow. | Market regime, distance from range extremes and trade/order-book imbalance. |
 
-Five strategy switches are enabled by default; Range Mean Reversion is disabled.
-The V2 runtime and its automatic Demo execution are also disabled by default
-and must be explicitly enabled. A strategy being enabled does not guarantee a
-signal or an order. See [strategy implementation](app/v2/strategies.py) and
-[configuration](app/config.py).
+The strategy engine is implemented in [app/v2](app/v2/). Five strategy switches
+are enabled by default; Range Mean Reversion is disabled. The engine and its
+automatic Demo execution are also disabled by default and must be explicitly
+enabled. A strategy being enabled does not guarantee a signal or an order. See
+[strategy implementation](app/v2/strategies.py) and [configuration](app/config.py).
 
 ### How the work runs concurrently
 
-In V2, the news pipeline runs as an asynchronous task alongside the market
+In the strategy engine, the news pipeline runs as an asynchronous task alongside the market
 strategy cycle. Market strategies can therefore be evaluated without waiting
 for slow news retrieval or classification. Within the market cycle,
 symbols and applicable strategies are evaluated in a loop; the diagram does
@@ -125,15 +125,19 @@ and prevent competing candidates from independently bypassing the limits.
 Settings are provided through environment variables and runner parameters;
 there is no settings dashboard yet.
 
-## ByBot V2 (direct Bybit Demo only)
+The repository also contains a separate news-signal workflow that supports
+local PAPER execution. It shares components with the strategy engine, but is
+not the six-strategy runtime described above.
 
-V2 adds a dynamically validated 17-symbol universe, five deterministic
-strategies, public WebSocket/REST features, durable multi-position reservations
-and run-scoped reports. Orders can target only the exact authenticated Bybit Demo
-domain through the explicit runner. Live, mainnet and testnet execution remain
-blocked.
+## Strategy engine
 
-V2 admission is side-aware and regime-routed. OI/funding and liquidation
+The engine supports a dynamically validated universe of up to 17 symbols, six
+deterministic strategies, public WebSocket/REST features, durable multi-position
+reservations and run-scoped reports. Orders can target only the authenticated
+Bybit Demo domain through explicit configuration. Live, mainnet and testnet
+execution remain blocked.
+
+Admission is side-aware and regime-routed. OI/funding and liquidation
 strategies require their own fresh inputs, edge proxies are bounded by the
 planned exit, current-cycle opportunities are ranked by net edge, and sizing is
 risk-, liquidity- and portfolio-capped. The optional RANGE mean-reversion
@@ -161,10 +165,9 @@ development never starts the burn-in or soak.
 
 ## Scope
 
-- V1 symbols: `BTCUSDT`, `ETHUSDT`; V2 dynamically evaluates 17 configured symbols
+- The strategy engine dynamically validates a configured universe of up to 17 symbols
 - Market: Bybit linear perpetuals
-- V1 maximum one open position; V2 supports independently limited positions per symbol
-- V1 leverage: 1x-2x; V2 Demo leverage: core 3x, liquid alts/memes 2x
+- Configurable limits for positions, exposure and leverage
 - Mandatory stop loss
 - No martingale or averaging down
 
