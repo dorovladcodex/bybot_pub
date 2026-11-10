@@ -7,9 +7,9 @@ deployment today. ByBot v1 may run on GCP only in `DATA_ONLY`, `PAPER`, or
 `BYBIT_DEMO`. Live trading remains explicitly disabled. Shadow live is
 observation-only and submits no orders.
 
-The current `docker-compose.yml` is development-oriented: it exposes FastAPI
-and PostgreSQL ports and contains local database defaults. Do not use it as-is
-on an internet-facing VM.
+The current `docker-compose.yml` is development-oriented: it binds FastAPI
+and PostgreSQL to localhost and contains local database defaults. Do not use it
+as-is on an internet-facing VM.
 
 ## Target topology
 
@@ -33,7 +33,7 @@ Before the first GCP deployment:
 1. Add a production Compose override that removes the PostgreSQL host-port
    mapping and binds any temporary API port to localhost only.
 2. Replace development database credentials and move secrets outside Git.
-3. Run the application container as a non-root user.
+3. Verify the application container runs as a non-root user and review filesystem permissions.
 4. Pin container image versions and deploy an immutable application image.
 5. Add PostgreSQL migrations, persistent-volume ownership checks, backups, and
    restore tests.

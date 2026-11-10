@@ -1,757 +1,117 @@
 # ByBot
 
-Lightweight, deterministic Bybit trading-bot foundation. Current builds support only
-`DATA_ONLY`, `PAPER`, and `BYBIT_DEMO`. **Live trading is intentionally blocked.**
+ByBot is a Python trading research and execution system for market data and news.
+It supports local paper simulation and explicitly gated Bybit Demo execution;
+**live exchange order submission is blocked**. Its optional LLM classifies news;
+strategy selection, risk, position sizing and order execution remain code-driven.
+This snapshot is for engineering review, not evidence of trading profitability.
 
-The LLM boundary is limited to compact news classification. Strategy, market
-filters, risk decisions, and paper execution are deterministic Python code.
+## Engineering highlights
 
-This public snapshot excludes private credentials, account data, historical
-exchange replay fixtures, and tests that depend on those private fixtures.
-Other automated tests remain available. The private development history and
-local databases are not part of this repository.
+- FastAPI modular monolith with asynchronous news and market-processing loops.
+- PostgreSQL and SQLAlchemy persistence for candidates, risk decisions, execution
+  transitions and portfolio state; Alembic manages schema migrations.
+- Durable reservations, idempotency constraints and per-symbol coordination
+  protect against duplicate submissions and conflicting positions.
+- Startup recovery and reconciliation compare persisted state with authoritative
+  exchange state; uncertain protection or critical failures block new entries.
+- Deterministic risk, freshness and exposure checks; public REST/WebSocket data.
+- Unit and integration tests, a Docker image and a synthetic local paper demo.
 
-## How ByBot works
+## Architecture
 
 ```mermaid
-flowchart TD
-    Settings["Settings<br/>Strategies, symbols and position limits<br/>Stop loss and take profit"]
-    News["News sources<br/>RSS and exchange announcements"]
-    Market["Bybit market data<br/>Prices, volume, order book<br/>Funding, open interest, liquidations"]
-    Classifier["News classification<br/>Asset, sentiment and importance<br/>Mock or configured AI classifier"]
-
-    News --> Classifier
-    Classifier --> NewsMomentum
-    Market --> Strategies
-    Settings -.-> Strategies
-
-    subgraph Strategies["Strategy engine"]
-        direction TB
-        NewsMomentum["1. News Momentum<br/>News plus price confirmation"]
-        Volume["2. Volume Breakout<br/>Price breakout plus volume"]
-        Funding["3. Open Interest / Funding Squeeze<br/>Price, positions and funding"]
-        Liquidation["4. Liquidation Momentum<br/>Liquidations plus price momentum"]
-        Meme["5. Meme Trend<br/>Meme-asset momentum and trends"]
-        Range["6. Range Mean Reversion<br/>Range-bound reversal - off by default"]
-    end
-
-    Strategies --> Candidate["Trade candidate<br/>Direction and proposed trade parameters"]
-    Candidate --> Risk["Risk checks<br/>Data freshness, limits, estimated costs<br/>Position size and protective stops"]
-    Settings -.-> Risk
-    Risk --> Decision{"Checks passed?"}
-    Decision -->|"No"| NoTrade["NO TRADE<br/>Record the reason"]
-    Decision -->|"Yes"| Execute["Execution<br/>Bybit Demo, when enabled"]
-    Execute --> Position["Position management<br/>Entry, stop loss and take profit"]
-    Position --> Close["Position closed<br/>Record outcome and trade history"]
-
-    Candidate --> Database[("PostgreSQL<br/>News, signals, decisions and trades")]
-    NoTrade --> Database
-    Position --> Database
-    Close --> Database
+flowchart LR
+    N[News feeds] --> I[Ingest and filter]
+    I --> C[Mock or optional LLM classification]
+    M[Public REST / WebSocket market data] --> F[Validate and build features]
+    C --> S[Deterministic strategies]
+    F --> S
+    S --> R[Score and risk controls]
+    R -->|rejected| X[No trade and reason]
+    R -->|approved| E[Execution boundary]
+    E --> P[Local paper simulation]
+    E --> D[Explicitly enabled Bybit Demo only]
+    R --> DB[(PostgreSQL)]
+    P --> DB
+    D --> DB
+    DB --> REC[Restart recovery and reconciliation]
 ```
 
-### Step by step
+The news-to-paper workflow and V2 strategy runtime share components but are
+separate paths. V2 implements six strategies; Range Mean Reversion is disabled
+by default. Research modules under `app/v4/` and `app/v5/` are experimental,
+not evidence of validated alpha. See [architecture](docs/ARCHITECTURE.md) and
+[strategies](app/v2/strategies.py).
 
-1. **Collect data.** The bot reads news and public market data, including prices,
-   volume, order-book information, funding, open interest and liquidations.
-   Availability depends on the configured providers and the strategy.
-2. **Filter and classify news.** Code normalizes and filters incoming items. A
-   configured classifier identifies the asset, sentiment, confidence, category
-   and urgency. The classifier may use an LLM; the default is a deterministic
-   mock. Invalid, neutral or insufficiently confident classifications do not
-   become eligible news signals.
-3. **Build market features.** Python code calculates rolling indicators, such
-   as price momentum, volume acceleration, order-book imbalance and market
-   regime. It also checks whether the data is available and fresh.
-4. **Evaluate strategies.** Enabled strategies inspect the relevant features
-   and produce trade candidates. News Momentum also requires an eligible news
-   classification; the other strategies use their own market inputs.
-5. **Score and check risk.** Code evaluates setup validity, confidence,
-   estimated costs and edge, data freshness, position limits and portfolio
-   exposure. Candidates can be rejected or deduplicated; eligible candidates
-   are ranked for selection.
-6. **Execute or do nothing.** A candidate that passes the checks may proceed to
-   execution if the configured mode permits it. Otherwise, no order is sent.
-   The six-strategy engine can execute in the explicitly configured Bybit Demo
-   environment. Live trading is blocked.
-7. **Manage and record.** The execution layer tracks order and position state,
-   verifies protective orders, and reconciles with the exchange when needed.
-   When persistence is configured, news, candidates, decisions and execution
-   events are stored for inspection and recovery.
+## Five-minute local paper demo
 
-### What the LLM does and what the code does
-
-| Component | Responsibility |
-| --- | --- |
-| **Optional LLM classifier** | Classifies filtered news into structured fields such as asset, sentiment, category and confidence. It does not place orders. |
-| **Python pipeline** | Collects and validates data, filters news, calculates market features, evaluates strategies and checks classifier output. |
-| **Scoring and risk code** | Scores candidates, estimates costs, applies limits and decides whether a candidate is eligible. |
-| **Execution and persistence code** | Sizes and submits permitted orders, manages position protection, reconciles state and stores the audit trail. |
-
-An LLM is not required for the pipeline to run: the default classifier is a
-deterministic mock. The LLM does not control position sizing, risk limits or
-order submission.
-
-### Six strategies
-
-| Strategy | What it looks for | Main inputs |
-| --- | --- | --- |
-| **News Momentum** | A significant classified news item followed by a price move in the same direction. | News sentiment and confidence; price momentum. |
-| **Volume Breakout** | A price breakout confirmed across time windows by accelerating volume and trade flow. | Breakout distance, volume acceleration and trade imbalance. |
-| **Open Interest / Funding Squeeze** | A directional price impulse interpreted alongside changing open interest and funding conditions. | Price momentum, open-interest change and funding deviation. |
-| **Liquidation Momentum** | Price continuation supported by recent, sufficiently strong liquidation activity. | Liquidation imbalance and intensity, price momentum and order book. |
-| **Meme Trend** | Momentum in supported meme assets with market activity and external trend context. | Price and volume, relative strength, order book and external trends. |
-| **Range Mean Reversion** | A potential reversal near a range extreme, confirmed by order flow. | Market regime, distance from range extremes and trade/order-book imbalance. |
-
-The strategy engine is implemented in [app/v2](app/v2/). Five strategy switches
-are enabled by default; Range Mean Reversion is disabled. The engine and its
-automatic Demo execution are also disabled by default and must be explicitly
-enabled. A strategy being enabled does not guarantee a signal or an order. See
-[strategy implementation](app/v2/strategies.py) and [configuration](app/config.py).
-
-### How the work runs concurrently
-
-In the strategy engine, the news pipeline runs as an asynchronous task alongside the market
-strategy cycle. Market strategies can therefore be evaluated without waiting
-for slow news retrieval or classification. Within the market cycle,
-symbols and applicable strategies are evaluated in a loop; the diagram does
-not imply that all six strategy calculations run in separate threads.
-
-Eligible candidates are scored and ranked for selection. Execution can be
-dispatched concurrently across symbols, while each symbol has a single-worker
-execution queue. Portfolio reservations and risk limits coordinate exposure
-and prevent competing candidates from independently bypassing the limits.
-
-Settings are provided through environment variables and runner parameters;
-there is no settings dashboard yet.
-
-The repository also contains a separate news-signal workflow that supports
-local PAPER execution. It shares components with the strategy engine, but is
-not the six-strategy runtime described above.
-
-## Strategy engine
-
-The engine supports a dynamically validated universe of up to 17 symbols, six
-deterministic strategies, public WebSocket/REST features, durable multi-position
-reservations and run-scoped reports. Orders can target only the authenticated
-Bybit Demo domain through explicit configuration. Live, mainnet and testnet
-execution remain blocked.
-
-Admission is side-aware and regime-routed. OI/funding and liquidation
-strategies require their own fresh inputs, edge proxies are bounded by the
-planned exit, current-cycle opportunities are ranked by net edge, and sizing is
-risk-, liquidity- and portfolio-capped. The optional RANGE mean-reversion
-challenger is disabled by default until it has enough out-of-sample evidence.
-
-Read-only validation (no order submission):
+Requires Docker Desktop, Docker Compose and Windows PowerShell. From this folder:
 
 ```powershell
-.\.venv\Scripts\python.exe -m alembic upgrade head
-.\.venv\Scripts\python.exe .\scripts\demo_v2_preflight.py
+powershell -ExecutionPolicy Bypass -File .\scripts\portfolio_demo.ps1
 ```
 
-Read-only alpha evidence check for a completed run:
-
-```powershell
-.\.venv\Scripts\python.exe .\scripts\v2_alpha_validation.py `
-  --artifacts .\artifacts\demo-v2\<run_id>
-```
-
-Exit code `2` means the run has insufficient evidence; the command never
-initializes exchange mutation code.
-
-Operator-authorized commands are documented in `docs/RUNBOOK.md`; automated
-development never starts the burn-in or soak.
-
-## Scope
-
-- The strategy engine dynamically validates a configured universe of up to 17 symbols
-- Market: Bybit linear perpetuals
-- Configurable limits for positions, exposure and leverage
-- Mandatory stop loss
-- No martingale or averaging down
-
-## Local setup (Windows 10/11, PowerShell)
-
-Prerequisites: install Python 3.11 or newer from `python.org` with the Python
-Launcher (`py`) enabled. Run the following commands from PowerShell:
-
-```powershell
-cd C:\path\to\bybot_pub
-py -3.11 --version
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-Keep that PowerShell window open while the API is running. In a second
-PowerShell window, verify both endpoints:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/health | ConvertTo-Json
-Invoke-RestMethod http://127.0.0.1:8000/status | ConvertTo-Json
-```
-
-Expected safety fields include `"status": "ok"` from `/health`. `/status`
-returns `"mode"`, `"live_trading": false`, `"trading_enabled"`,
-`"trading_paused"`, `"active_symbols"`, `"open_paper_position"`,
-`"last_signal"`, `"market"`, and `"risk_status"`. Stop the server with
-`Ctrl+C`.
-
-If Python 3.11 is not installed but a newer supported version is available,
-replace both `py -3.11` occurrences with `py -3`.
-
-### Run tests later
-
-```powershell
-cd C:\path\to\bybot_pub
-.\.venv\Scripts\python.exe -m pytest -q
-```
-
-## Docker Compose
-
-```powershell
-Copy-Item .env.example .env
-docker compose up --build
-```
-
-The API is exposed on port 8000 and PostgreSQL on port 5432. Pipeline state is
-persisted in PostgreSQL. Apply migrations before starting the API outside Compose:
-
-```powershell
-$env:DATABASE_URL="postgresql+psycopg://bybot:bybot@localhost:5432/bybot"
-.\.venv\Scripts\python.exe -m alembic upgrade head
-```
-
-For normal RSS-to-Codex dry-run processing, keep these safety settings in `.env`:
-
-```powershell
-NEWS_CLASSIFIER_MODE=codex_cli
-CODEX_CLI_ENABLED=true
-CODEX_CLI_MIN_NEWS_IMPORTANCE=0.70
-PAPER_STARTING_EQUITY_USDT=10000
-AUTO_PAPER_EXECUTION=false
-BYBIT_ENABLE_TRADING=false
-```
-
-Paper sizing and PnL use `PAPER_STARTING_EQUITY_USDT`; Bybit demo equity is
-read-only context and never funds the paper account.
-
-### PostgreSQL end-to-end smoke test
-
-With Docker Desktop running, the local virtual environment prepared, and Codex
-CLI authenticated, run this single command from the project root:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\postgres_e2e_smoke.ps1
-```
-
-The script starts only PostgreSQL in Docker and runs FastAPI locally. It leaves
-PostgreSQL running, stops its local uvicorn process, and never enables paper or
-exchange execution.
-
-## Automatic paper execution
-
-Automatic paper execution is disabled by default. To enable it explicitly in
-PAPER mode, set `AUTO_PAPER_EXECUTION=true`. Exchange execution remains blocked
-by `BYBIT_ENABLE_TRADING=false`.
-
-Paper fills use configurable deterministic costs:
-
-```powershell
-PAPER_MAKER_FEE_BPS=2
-PAPER_TAKER_FEE_BPS=6
-PAPER_SLIPPAGE_BPS=2
-```
-
-Paper account reporting uses one formula: `equity = starting_equity +
-cumulative net realized PnL + current unrealized PnL`. `GET /paper/pnl`
-returns `starting_equity`, `equity`, realized and unrealized PnL, total PnL,
-fees paid, and open/closed position counts. Closed account totals are persisted
-in PostgreSQL and reconciled from durable trades during startup recovery.
-
-Only a fresh, non-expired `READY` candidate with an approved risk preview can
-open a paper position. PostgreSQL enforces one paper execution per candidate,
-including across application restarts.
-
-With the local API running in `APP_ENV=local`, `TEST_MODE=true`, PAPER mode, and
-`AUTO_PAPER_EXECUTION=false`, run the deterministic execution lifecycle smoke test:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\paper_execution_smoke.ps1
-```
-
-It verifies `READY → PAPER_OPENED → idempotent duplicate → TAKE_PROFIT →
-PAPER_CLOSED` and finishes with `OVERALL: PASS`.
-
-To verify the complete automatic path without calling the manual candidate
-execution endpoint, keep Docker Desktop running and run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\auto_paper_execution_smoke.ps1
-```
-
-The script creates an isolated temporary PostgreSQL database, starts FastAPI
-locally with `AUTO_PAPER_EXECUTION=true` and `BYBIT_ENABLE_TRADING=false`, tests
-automatic open, duplicate protection, take-profit close, and restart recovery,
-then removes the temporary database. The PostgreSQL container remains running.
-
-To verify sanitized database diagnostics locally:
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_auto_paper_execution.py -k persistence_failure -s
-```
-
-PostgreSQL-only transaction tests run when a dedicated test database is supplied:
-
-```powershell
-$env:BYBOT_TEST_POSTGRES_URL="postgresql+psycopg://bybot:bybot@localhost:5432/bybot_test"
-.\.venv\Scripts\python.exe -m pytest tests\test_postgres_paper_execution.py -q
-```
-
-Use only a disposable test database for that command. Error responses expose a
-sanitized code such as `DB_INTEGRITY_ERROR`; credentials and `DATABASE_URL` are
-never returned.
-
-## Market data
-
-By default, local development uses mock market data so the app and tests run
-without internet access:
-
-```powershell
-MARKET_DATA_PROVIDER=MOCK
-```
-
-To test public Bybit market data in `DATA_ONLY` mode, edit `.env`:
-
-```powershell
-BOT_MODE=DATA_ONLY
-MARKET_DATA_PROVIDER=BYBIT_REST
-BYBIT_PUBLIC_BASE_URL=https://api.bybit.com
-```
-
-Then start the API:
-
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-Verify market data:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/market | ConvertTo-Json -Depth 10
-Invoke-RestMethod http://127.0.0.1:8000/market/BTCUSDT | ConvertTo-Json -Depth 10
-Invoke-RestMethod http://127.0.0.1:8000/market/ETHUSDT | ConvertTo-Json -Depth 10
-Invoke-RestMethod http://127.0.0.1:8000/status | ConvertTo-Json -Depth 10
-```
-
-If Bybit is unreachable, `/market` and `/status.market` report
-`"DATA_UNAVAILABLE"` and the bot stays safe. No order-placement code exists.
-The Phase 2 adapter uses public Bybit V5 REST polling first. The interface is
-kept small so a WebSocket provider can replace it later without changing
-strategy, risk, or API code.
-
-## Private account connection, read-only
-
-Phase 3A can connect to Bybit private account data for reconciliation only.
-It does not place orders. Use demo API keys with read-only permissions.
-
-Edit `.env`:
-
-```powershell
-notepad .env
-```
-
-Set these values:
-
-```env
-BYBIT_ENV=demo
-BYBIT_ENABLE_TRADING=false
-BYBIT_API_KEY=your_demo_read_only_key
-BYBIT_API_SECRET=your_demo_read_only_secret
-BYBIT_PRIVATE_DEMO_BASE_URL=https://api-demo.bybit.com
-```
-
-Start the API:
-
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-Verify account status:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/account | ConvertTo-Json -Depth 10
-Invoke-RestMethod http://127.0.0.1:8000/status | ConvertTo-Json -Depth 10
-```
-
-`/account` force-refreshes private account data. On startup and on `/status`,
-the app refreshes account data when the cached state is missing or stale. If a
-refresh fails after a previous success, the last connected account state is kept
-and marked `stale=true` with `last_error`, instead of crashing or falsely
-disconnecting paper trading context.
-
-Expected safety fields:
-
-- `trading_enabled` is `false`
-- `order_placement_blocked` is `true`
-- `account.trading_enabled` is `false`
-- invalid keys show `connected=false` and `last_error`, without crashing
-
-## Paper trading simulation
-
-Phase 3B simulates internal paper trades using current market data. It never
-submits Bybit orders. Keep:
-
-```env
-BYBIT_ENABLE_TRADING=false
-BOT_MODE=PAPER
-```
-
-Start the API:
-
-```powershell
-cd C:\path\to\bybot_pub
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-Inject a manual paper test signal:
-
-```powershell
-$body = @{
-  symbol = "BTCUSDT"
-  side = "BUY"
-  confidence = 0.9
-  expected_edge_bps = 20
-  stop_loss_pct = 0.5
-  take_profit_pct = 1.0
-} | ConvertTo-Json
-
-Invoke-RestMethod `
-  -Method Post `
-  -Uri http://127.0.0.1:8000/paper/test-signal `
-  -ContentType "application/json" `
-  -Body $body | ConvertTo-Json -Depth 10
-```
-
-Inspect paper state:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/paper/positions | ConvertTo-Json -Depth 10
-Invoke-RestMethod http://127.0.0.1:8000/paper/trades | ConvertTo-Json -Depth 10
-Invoke-RestMethod http://127.0.0.1:8000/paper/pnl | ConvertTo-Json -Depth 10
-Invoke-RestMethod http://127.0.0.1:8000/status | ConvertTo-Json -Depth 10
-```
-
-Manually close the open paper position at the latest market price:
-
-```powershell
-Invoke-RestMethod `
-  -Method Post `
-  -Uri http://127.0.0.1:8000/paper/close-position | ConvertTo-Json -Depth 10
-```
-
-Closed positions move from `/paper/positions` to `/paper/trades`. Realized PnL
-is reflected in `/paper/pnl` and `/status`.
-
-Safety rules enforced:
-
-- max one open paper position
-- stop-loss is mandatory
-- no averaging down
-- no martingale
-- market data must be available
-- RiskManager approval is required
-- position size is capped by equity, available balance, leverage, max notional,
-  and max percentage of equity
-- paper PnL subtracts estimated fees and slippage
-- automatic closes run for `stop_loss`, `take_profit`, and `timeout`
-
-## News ingestion (Phase 4A)
-
-The bot can read public RSS news and filters it locally before passing only a
-compact title/summary/source/timestamp/asset hint to the deterministic mock
-classifier. It never sends market ticks, order books, candles, full articles,
-or API credentials to a classifier.
-
-For local development, enable the RSS reader in `.env` (the defaults below are
-also in `.env.example`):
-
-```env
-BOT_MODE=PAPER
-BYBIT_ENABLE_TRADING=false
-NEWS_ENABLE_RSS=true
-NEWS_RSS_URLS=["https://cointelegraph.com/rss"]
-NEWS_POLL_INTERVAL_SECONDS=60
-NEWS_MAX_ITEM_AGE_MINUTES=60
-NEWS_MIN_IMPORTANCE_TO_CLASSIFY=0.3
-NEWS_ENABLE_MOCK_CLASSIFIER=true
-```
-
-Run the app, then inspect the in-memory feed state:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/news | ConvertTo-Json -Depth 10
-Invoke-RestMethod http://127.0.0.1:8000/news/filtered | ConvertTo-Json -Depth 10
-Invoke-RestMethod http://127.0.0.1:8000/news/classifications | ConvertTo-Json -Depth 10
-Invoke-RestMethod http://127.0.0.1:8000/news/filter-debug | ConvertTo-Json -Depth 10
-```
-
-To test filtering without any external request:
-
-```powershell
-$body = @{
-  title = "Bitcoin ETF sees major BlackRock inflow"
-  summary = "Fresh BTC fund flow may affect the crypto market."
-  source = "local-test"
-  url = "https://example.invalid/news"
-  published_at = (Get-Date).ToUniversalTime().ToString("o")
-} | ConvertTo-Json
-
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/news/test-item `
-  -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 10
-```
-
-RSS failures only set `news_status`/`news_last_error` in `/status`; they do not
-stop the API. This phase remains paper-only and contains no Bybit order
-placement.
-
-`/news/filter-debug` shows each recent decision, including `matched_keywords`,
-importance, and one of `accepted`, `old_news`, `duplicate`, `unrelated_asset`,
-`missing_keywords`, or `low_importance`.
-
-## News-to-signal dry run (Phase 4C)
-
-Accepted classifications can be evaluated against deterministic market data
-without opening a paper position. Keep these safety settings in `.env`:
-
-```env
-BOT_MODE=PAPER
-BYBIT_ENABLE_TRADING=false
-TEST_MODE=false
-AUTO_PAPER_EXECUTION=false
-SIGNAL_MIN_CLASSIFICATION_CONFIDENCE=0.80
-SIGNAL_MIN_NEWS_IMPORTANCE=0.70
-SIGNAL_TTL_SECONDS=300
-SIGNAL_CONFIRMATION_WINDOW_SECONDS=60
-SIGNAL_REEVALUATION_INTERVAL_SECONDS=5
-SIGNAL_CONFLICT_THRESHOLD_PCT=0.30
-SIGNAL_MIN_EXPECTED_EDGE_BPS=12
-SIGNAL_DEFAULT_STOP_LOSS_PCT=0.5
-SIGNAL_DEFAULT_TAKE_PROFIT_PCT=1.0
-```
-
-List dry-run state:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/signals/candidates | ConvertTo-Json -Depth 12
-Invoke-RestMethod http://127.0.0.1:8000/signals/latest | ConvertTo-Json -Depth 12
-Invoke-RestMethod http://127.0.0.1:8000/signals/dry-run | ConvertTo-Json -Depth 12
-```
-
-Create a candidate from an already classified `news_id`:
-
-```powershell
-$body = @{ news_id = "replace-with-news-id"; reprocess = $false } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/signals/test-from-news `
-  -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 12
-```
-
-The response contains a candidate and RiskManager preview with capped size,
-notional, and rejection reasons. `execution_attempted=false` and
-`paper_position_opened=false` are invariant in this phase.
-
-### Pending confirmation lifecycle (Phase 4D)
-
-Strong classifications now remain `PENDING_CONFIRMATION` while the market is
-sideways or confirmation data is temporarily insufficient. Every five seconds
-the app refreshes market data and updates the same candidate until it becomes
-`READY`, `BLOCKED`, or `EXPIRED`. RiskManager preview runs only for `READY`.
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/signals/pending | ConvertTo-Json -Depth 12
-Invoke-RestMethod http://127.0.0.1:8000/signals/history | ConvertTo-Json -Depth 12
-Invoke-RestMethod http://127.0.0.1:8000/signals/latest | ConvertTo-Json -Depth 12
-```
-
-Inspect or manually recheck one candidate:
-
-```powershell
-$candidateId = "replace-with-candidate-id"
-Invoke-RestMethod "http://127.0.0.1:8000/signals/$candidateId" | ConvertTo-Json -Depth 12
-Invoke-RestMethod -Method Post "http://127.0.0.1:8000/signals/$candidateId/recheck" |
-  ConvertTo-Json -Depth 12
-```
-
-Candidate output separates `proposed_action` from `final_action` and includes
-the complete `evaluation_history`. Pending, blocked, and expired candidates
-return `preview_performed=false` with `candidate is not tradeable yet` instead
-of irrelevant order-validation errors.
-
-### Deterministic local market confirmation test
-
-The test-only snapshot endpoint is available only with all safety conditions:
-
-```env
-APP_ENV=local
-TEST_MODE=true
-BOT_MODE=PAPER
-AUTO_PAPER_EXECUTION=false
-BYBIT_ENABLE_TRADING=false
-```
-
-It rechecks one candidate through the normal confirmation and risk-preview
-logic without writing into the global Bybit market cache:
-
-```powershell
-$candidateId = "replace-with-pending-candidate-id"
-$body = @{
-  price = 60300
-  bid = 60299
-  ask = 60301
-  price_change_1m_pct = 0.30
-  trend_direction = "BULLISH"
-  trend_score = 0.60
-  volatility_pct = 1.0
-  volume_24h = 25000
-  volume_change_pct = 25
-  volume_spike = $true
-  fresh = $true
-} | ConvertTo-Json
-
-Invoke-RestMethod -Method Post `
-  -Uri "http://127.0.0.1:8000/signals/$candidateId/test-market-snapshot" `
-  -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 12
-```
-
-The endpoint returns `404` outside local test mode. It always reports
-`execution_attempted=false`, `paper_position_opened=false`, and blocked exchange
-order placement.
-
-## Optional real LLM classifier (Phase 4E)
-
-The default remains deterministic mock classification:
-
-```env
-NEWS_CLASSIFIER_MODE=mock
-```
-
-To configure an OpenAI-compatible structured-output provider, keep credentials
-only in the ignored `.env` file and set:
-
-```env
-NEWS_CLASSIFIER_MODE=llm
-LLM_API_KEY=replace-with-secret-provider-key
-LLM_API_URL=https://api.openai.com/v1/chat/completions
-LLM_MODEL=gpt-4.1-mini
-LLM_CLASSIFIER_VERSION=news-v1
-LLM_ALLOW_MOCK_FALLBACK=false
-```
-
-The classifier sends only normalized filtered-news fields. It never receives
-Bybit credentials, wallet/account data, positions, orders, market snapshots,
-logs, links to follow, or raw webpage HTML. Invalid output, provider errors,
-timeouts, budget rejection, and open circuit breakers produce a non-tradeable
-neutral `FAILED` classification.
-
-Trade eligibility is calculated centrally. Only `SUCCESS` or `CACHE_HIT`
-classifications with directional sentiment, sufficient confidence, a supported
-BTC/ETH/MARKET asset, valid category, and no error may enter signal generation.
-Neutral, failed, low-confidence, OTHER-asset, and mock-fallback results include
-explicit `eligibility_reasons` and remain non-tradeable.
-
-Inspect classifier health and budgets:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/news/classifier/status | ConvertTo-Json -Depth 10
-Invoke-RestMethod http://127.0.0.1:8000/news/classifier/metrics | ConvertTo-Json -Depth 10
-```
-
-`POST /news/classifier/test` is available only under `APP_ENV=local` and
-`TEST_MODE=true`. It does not store news, create a signal, or execute a trade.
-
-When `NEWS_CLASSIFIER_MODE=llm` has no usable credential (including the fake
-`.env.example` placeholder), `/news/classifier/status` reports `UNAVAILABLE`,
-`configured=false`, `provider_available=false`, and `PROVIDER_UNAVAILABLE`.
-No provider request or request/token budget is consumed.
-
-### Codex CLI classifier provider
-
-Codex CLI can be selected without placing an API credential in ByBot:
-
-```env
-NEWS_CLASSIFIER_MODE=codex_cli
-CODEX_CLI_ENABLED=true
-CODEX_CLI_PATH=codex
-CODEX_CLI_MODEL=gpt-5.4-mini
-CODEX_CLI_FALLBACK_MODEL=gpt-5.6-luna
-CODEX_CLI_REASONING_EFFORT=low
-CODEX_CLI_FALLBACK_MIN_CONFIDENCE=0.75
-AUTO_PAPER_EXECUTION=false
-BYBIT_ENABLE_TRADING=false
-```
-
-Each classification runs `codex exec` with `shell=False`, an isolated temporary
-directory, ephemeral/read-only mode, ignored user config, a UTF-8 schema file,
-and the news prompt over stdin. The fallback model is called only for a valid
-neutral primary result below the confidence threshold. Timeout, authentication,
-invalid JSON/executable, and budget failures never trigger fallback. Existing
-cache, eligibility, rate, budget, retry, and circuit-breaker controls remain in
-force.
-- real exchange execution remains blocked
-
-Sizing defaults in `.env`:
-
-```env
-MAX_POSITION_NOTIONAL_USDT=5000
-MAX_POSITION_NOTIONAL_PCT_OF_EQUITY=5
-MIN_POSITION_NOTIONAL_USDT=10
-DEFAULT_PAPER_FEES_BPS=6
-DEFAULT_SLIPPAGE_BPS=2
-MIN_NET_EDGE_BPS=5
-```
-
-For example, a very tight `stop_loss_pct` may produce a large risk-based size,
-but the final paper size is reduced so notional stays within the configured
-caps.
-
-Paper trades are also rejected when the take-profit target is too small to cover
-round-trip fees, slippage, and `MIN_NET_EDGE_BPS`. Manual `expected_edge_bps`
-cannot exceed the configured take-profit target.
-
-## Safety
-
-`BOT_MODE=LIVE` (or any unsupported mode) fails configuration validation and
-prevents application startup. `PaperExecutionEngine` only accepts PAPER mode.
-`BYBIT_ENABLE_TRADING=true` and `BYBIT_LIVE_TRADING_ENABLED=true` fail
-configuration validation. Live/mainnet/testnet execution remains impossible.
-The only exchange adapter is Bybit Demo and it requires the complete explicit
-Demo gate plus exact Demo domains.
-
-## Repair historical NewsItem payloads
-
-Apply migrations first, inspect without writes, then apply the transactional
-repair. Host-run commands use the PostgreSQL URL with `127.0.0.1`:
-
-```powershell
-.\.venv\Scripts\python.exe -m alembic upgrade head
-.\.venv\Scripts\python.exe .\scripts\repair_news_payloads.py --dry-run
-.\.venv\Scripts\python.exe .\scripts\repair_news_payloads.py --apply
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-Unrecoverable records are preserved in `persistence_quarantine` and excluded
-from normal startup restore. `/news/restore-status` and `/status` expose counts
-and sanitized warnings without returning archived payloads.
-
-See [PLAN.md](PLAN.md) for phase boundaries.
+The isolated Compose project starts PostgreSQL and the API with mock data and
+classification. It checks safety, injects synthetic news, rejects stale data,
+creates a paper trade, checks a duplicate, closes it and recreates the API to
+verify recovery from PostgreSQL. It does not use exchange credentials, send
+orders or call an LLM. The first image build may take longer than five minutes.
+
+On a successful run, checkpoints include `STALE MARKET DATA -> NO_TRADE: PASS`,
+`IDEMPOTENT DUPLICATE: PASS`, `POSTGRESQL RECOVERY -> SAME TRADE AND EQUITY: PASS`
+and `OVERALL: PASS`.
+
+- [Health](http://127.0.0.1:8010/health), [API explorer](http://127.0.0.1:8010/docs),
+  [paper trades](http://127.0.0.1:8010/paper/trades) and
+  [paper PnL](http://127.0.0.1:8010/paper/pnl).
+- Run again with `-SkipBuild` only after building the image.
+- Stop containers and retain demo data:
+  `docker compose -p bybot-portfolio -f compose.portfolio.yml down`.
+  Add `-v` only when intentionally deleting the demo database.
+
+## Stack and validation
+
+Python 3.11, FastAPI/Pydantic, PostgreSQL, SQLAlchemy/Alembic, Docker Compose,
+pytest and Bybit REST/WebSocket APIs. Development setup uses
+`python -m pip install -r requirements-dev.txt`, then `python -m pytest -q`.
+The PostgreSQL-specific tests require `BYBOT_TEST_POSTGRES_URL` pointing to a
+disposable database named `bybot_test*` or `*_test`; otherwise they are skipped.
+Use the `postgresql+psycopg://` URL scheme for the psycopg v3 driver.
+Never point tests at a real database. The CI workflow runs the safe suite with
+an isolated PostgreSQL service. Its result must be checked on GitHub.
+
+## AI and safety boundaries
+
+The optional LLM receives filtered, compact news and returns structured
+classification. Its output is validated and may be rejected; it cannot size or
+submit an order, override risk or orchestrate strategies. The default mock
+classifier needs no API key. LLM availability, output quality and cost are
+limitations; tests and the local demo use mocks.
+
+The demo is PAPER only. A separate execution path can submit orders **only** to
+Bybit Demo after explicit configuration, credentials and authorization. Live,
+mainnet and testnet order execution are blocked. The API has no authentication;
+some test-named endpoints are not restricted to TEST_MODE. Run it on a trusted
+local machine only, never expose it directly to the internet. Local Compose
+credentials are examples, not production credentials.
+
+## Known limitations
+
+- Single-process runtime and in-memory market feature history limit restart and
+  horizontal scaling; not a production deployment design.
+- Legacy financial tables use floating-point storage; large execution and runtime
+  modules need careful future decomposition with regression coverage.
+- External market/news availability, exchange behavior and simulated costs can
+  differ from observed fills. Backtests do not prove future performance.
+- Dependency ranges are not locked; security scanning and deployment hardening
+  are still needed. GCP deployment is a plan, not a verified deployment.
+- This sanitized public snapshot excludes private account data and private replay
+  fixtures, so its tests do not prove full real-exchange behavior.
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Operations runbook](docs/RUNBOOK.md)
-- [Security policy](docs/SECURITY.md)
-- [Planned GCP deployment](docs/GCP_DEPLOYMENT.md)
+[Architecture](docs/ARCHITECTURE.md) · [Project state](docs/PROJECT_STATE.md) ·
+[Runbook](docs/RUNBOOK.md) · [Security](docs/SECURITY.md) ·
+[Planned GCP deployment](docs/GCP_DEPLOYMENT.md) ·
+[Backtesting code](app/backtest/) · [Configuration](app/config.py)

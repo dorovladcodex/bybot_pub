@@ -25,7 +25,7 @@ soak without the user's explicit `-AllowDemoOrders` confirmation.
 - `app/db/persistence.py`: SQLAlchemy rows and atomic persistence operations.
 - `app/v2/`: V2 universe, rolling features, five strategies, scoring,
   durable portfolio reservations, Demo coordinator, analytics and runtime.
-- `alembic/versions/`: migrations; current head is `20260715_0014`.
+- `alembic/versions/`: migrations; current head is `20260811_0015`.
 - `scripts/repair_news_payloads.py`: transactional historical NewsItem audit,
   deterministic repair, and quarantine (`--dry-run` before `--apply`).
 - `tests/`: unit/API tests plus optional PostgreSQL regression tests.
