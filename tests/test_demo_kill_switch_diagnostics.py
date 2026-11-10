@@ -417,7 +417,9 @@ def test_unknown_protection_error_is_not_recoverable() -> None:
 
 
 def test_diagnostics_selects_newest_unresolved_before_older_terminal() -> None:
-    older = resolved_execution()
+    older = resolved_execution().model_copy(update={
+        "created_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
+    })
     candidate, _, _, _ = candidate_bundle()
     unresolved = DemoExecutionRecord(
         candidate_id=candidate.id, run_id="new-run", order_link_id="new-entry",
@@ -425,7 +427,8 @@ def test_diagnostics_selects_newest_unresolved_before_older_terminal() -> None:
         symbol=Symbol.BTCUSDT, side=Side.BUY,
         requested_quantity=Decimal("0.001"), accepted_quantity=Decimal("0.001"),
         average_fill_price=Decimal("64000"),
-        created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+        created_at=datetime(2021, 1, 1, tzinfo=timezone.utc),
+        updated_at=datetime(2021, 1, 1, tzinfo=timezone.utc),
     )
     repository = DiagnosticRepository(older)
     repository.load_demo_executions = lambda: [older, unresolved]
