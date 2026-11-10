@@ -2,7 +2,7 @@
 
 ## Operating constraint
 
-ByBot v1 must run only in `DATA_ONLY`, `PAPER`, or `BYBIT_DEMO`. Live trading is
+ByBot must run only in `DATA_ONLY`, `PAPER`, or `BYBIT_DEMO`. Live trading is
 disabled in configuration and absent from the execution architecture. Stop the
 application if `/status` ever reports `live_trading` other than `false`.
 
@@ -87,7 +87,7 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/paper/close-position | Conv
 
 ### BYBIT_DEMO
 
-This is a planned later-phase procedure. Use only Bybit demo endpoints and
+This path is implemented and requires explicit authorization. Use only Bybit demo endpoints and
 demo-only API credentials. Before enabling it, verify endpoint allowlisting,
 credential scope, order reconciliation, stop behavior, and restart recovery.
 Never reuse a production API key.

@@ -10,4 +10,8 @@ COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 
+RUN addgroup --system bybot && adduser --system --ingroup bybot bybot \
+    && mkdir -p /app/artifacts && chown bybot:bybot /app/artifacts
+USER bybot
+
 CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]

@@ -25,28 +25,28 @@ deployment host.
 
 ## Bybit controls
 
-- Phase 1 uses mocks and does not require a Bybit key.
-- Phase 3A may use Bybit demo read-only keys for private account data only.
+- Mock mode does not require a Bybit key.
+- Read-only private account access can use demo-only read-only keys.
 - DATA_ONLY and shadow-live public data should use no authenticated key.
 - BYBIT_DEMO must use demo-only endpoints and demo-only credentials.
 - Never grant withdrawal permission.
 - Apply the narrowest API permissions and IP allowlisting available.
-- `BYBIT_ENABLE_TRADING=true` is rejected during configuration validation in
-  Phase 3A.
+- `BYBIT_ENABLE_TRADING=true` is rejected during configuration validation.
 - The application must reject production trading endpoints in v1.
 - A configured credential must not imply permission to execute.
 
 ## Application controls
 
 - Keep the mode allowlist in validated configuration.
-- Preserve the independent `RiskManager` as final authority.
+- Preserve the independent risk and portfolio gates in each execution path.
 - Default to `NO_TRADE` on stale data, classifier failure, low confidence,
   provider instability, wide spread, or insufficient expected edge.
-- Require a stop loss and limit to one position and 1x-2x leverage.
+- Require protective stops and enforce configured position and leverage limits.
 - Never allow the LLM to create execution commands or override deterministic
   controls.
 - Validate all external data and cap lengths, timestamps, and numeric ranges.
-- Add authentication before exposing the dashboard beyond localhost.
+- The API has no authentication; some test-named routes are not gated by
+  `TEST_MODE`. Bind it to localhost and do not expose it to untrusted clients.
 
 ## LLM classifier boundary
 
